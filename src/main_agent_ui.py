@@ -2,7 +2,8 @@
 import os, re, json
 import streamlit as st
 from dotenv import load_dotenv
-
+from typing import Tuple
+import math
 from tool1 import extract_research_info, calculate_properties
 
 try:
@@ -22,7 +23,6 @@ from langchain_core.prompts import ChatPromptTemplate
 load_dotenv()
 groq_api_key = os.getenv("GROQ_API_KEY")
 os.environ["GROQ_API_KEY"] = groq_api_key or ""
-# API 설정 여부 플래그
 API_READY = bool(groq_api_key)
 
 st.set_page_config(
@@ -75,7 +75,6 @@ st.markdown(
         background: #fee2e2;
         color: #b91c1c;
     }
-
     .aep-section-title {
         font-size: 1.05rem;
         font-weight: 700;
@@ -95,7 +94,6 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
 
 
 
@@ -138,9 +136,13 @@ You will base your reasoning on both the **research objective** and the **calcul
 - LogP: 0 ~ 3  
 - MW: < 500  
 - LogS: -3 ~ -1  
-- TPSA: < 100  
+- TPSA: < 120  
 - Toxicity: Low (toxicity_score 0~1)  
-- pKa: 6.5 ~ 7.4  
+- pKa: 6.5 ~ 7.4
+- H_Donors: < 6
+- H_Acceptors < 11
+- LogD_pH7.4: -2 ~ 3
+- LogD_pH6.5: -1 ~ 3  
 
 ---
 
@@ -174,9 +176,301 @@ Instructions for constructing the query:
     })
     return resp.content.strip()
 
+
+# =========================
+def build_rag_block(rag_result: dict,
+                    proc_char_limit: int = 2000,
+                    section_char_limit: int = 700,
+                    modified_char_limit: int = 1000,
+                    token_limit_tokens: int = 20000,
+                    token_est_chars_per_token: float = 4.0) -> Tuple[str, dict]:
+    """
+    Improved build_rag_block: emits structured, tag-rich text blocks for the LLM.
+    Each procedure/section/modified entry is preceded by a metadata header including CID, score and tags.
+    """
+
+    def stringify_item(it):
+        if isinstance(it, dict):
+            # prefer structured fields
+            cid = it.get("meta", {}).get("chunk_id") or it.get("cid") or it.get("chunk_id") or it.get("cid", "")
+            score = it.get("score") or (it.get("meta", {}).get("score") if isinstance(it.get("meta", {}), dict) else None)
+            sec = it.get("meta", {}).get("section") or it.get("section") or ""
+            tags = it.get("pertains_to") or it.get("meta", {}).get("pertains_to_property") or it.get("tags") or it.get("type") or ""
+            content = it.get("content") or it.get("text") or json.dumps(it, ensure_ascii=False)
+            header = f"[CID:{cid}"
+            if score is not None:
+                header += f" | SCORE:{float(score):.3f}"
+            if sec:
+                header += f" | SECTION:{sec}"
+            if tags:
+                if isinstance(tags, (list, tuple)):
+                    tags_str = ",".join(map(str, tags))
+                else:
+                    tags_str = str(tags)
+                header += f" | TAGS:{tags_str}"
+            header += "]"
+            return header + "\n" + content
+        return str(it)
+
+    def estimate_tokens_from_chars(n_chars: int) -> int:
+        return math.ceil(n_chars / token_est_chars_per_token)
+
+    proc_raw = rag_result.get("procedure_steps", []) or []
+    sec_raw = rag_result.get("section_topk", []) or []
+    mod_raw = rag_result.get("modified_steps", []) or []
+
+    # Normalize procedure items into dicts with step/meta/content if necessary
+    proc_items = []
+    for p in proc_raw:
+        if isinstance(p, dict):
+            step = p.get("step")
+            content = p.get("content") or p.get("text") or ""
+            meta = p.get("meta", {})
+            proc_items.append({"step": step, "content": content, "meta": meta, "raw": p})
+        else:
+            s = str(p)
+            m = re.search(r'\b[Ss]tep\s*(\d{1,2})\b', s)
+            step = int(m.group(1)) if m else None
+            # attempt to extract CID/score tokens in square brackets if present
+            meta = {}
+            cid_m = re.search(r'\[CID:([A-Za-z0-9_:-]+)', s)
+            if cid_m:
+                meta["chunk_id"] = cid_m.group(1)
+            score_m = re.search(r'SCORE:([0-9.]+)', s)
+            if score_m:
+                try:
+                    meta["score"] = float(score_m.group(1))
+                except Exception:
+                    pass
+            # remove leading bracketed header for content clarity
+            content = re.sub(r'^\[.*?\]\s*', '', s)
+            proc_items.append({"step": step, "content": content, "meta": meta, "raw": s})
+
+    proc_items_sorted = sorted(proc_items, key=lambda x: (x["step"] is None, x["step"] if x["step"] is not None else 9999))
+
+    # build block pieces with explicit meta headers
+    pieces = []
+    pieces.append("=== PROCEDURE: START ===\n")
+    for it in proc_items_sorted:
+        cid = it.get("meta", {}).get("chunk_id") or it.get("meta", {}).get("chunk_id") or ""
+        score = it.get("meta", {}).get("score")
+        step = it.get("step")
+        header = f"[CID:{cid}" if cid else "[CID:UNKNOWN"
+        if score is not None:
+            header += f" | SCORE:{float(score):.3f}"
+        if step is not None:
+            header += f" | STEP:{step}"
+        header += "]"
+        content = it.get("content", "").strip()
+        # truncate per-proc limit for initial assembly (but keep plenty)
+        display = content if len(content) <= proc_char_limit else content[:proc_char_limit].rsplit("\n",1)[0] + "\n...[truncated]\n"
+        pieces.append(f"{header}\n{display}\n\n")
+    pieces.append("=== PROCEDURE: END ===\n\n")
+
+    # sections block
+    pieces.append("=== SECTIONS: START ===\n")
+    for s in sec_raw:
+        block = stringify_item(s) if not isinstance(s, str) else s
+        # apply section_char_limit truncation
+        sec_text = block if len(block) <= section_char_limit else block[:section_char_limit].rsplit("\n",1)[0] + "\n...[truncated]\n"
+        pieces.append(f"{sec_text}\n\n")
+    pieces.append("=== SECTIONS: END ===\n\n")
+
+    # modified / alerts block: include structured fields if dict
+    pieces.append("=== MODIFIED: START ===\n")
+    for m in mod_raw:
+        if isinstance(m, dict):
+            cid = m.get("cid") or m.get("meta", {}).get("chunk_id") or ""
+            score = m.get("score") or m.get("meta", {}).get("score")
+            mtype = m.get("type") or ""
+            pertains = m.get("pertains_to") or m.get("pertains_to_property") or m.get("meta", {}).get("pertains_to_property") or ""
+            step = m.get("step")
+            header = f"[CID:{cid}"
+            if score is not None:
+                header += f" | SCORE:{float(score):.3f}"
+            if mtype:
+                header += f" | TYPE:{mtype}"
+            if step is not None:
+                header += f" | STEP:{step}"
+            if pertains:
+                if isinstance(pertains, (list, tuple)):
+                    header += f" | TAGS:{','.join(map(str,pertains))}"
+                else:
+                    header += f" | TAGS:{pertains}"
+            header += "]"
+            content = m.get("content") or ""
+            display = content if len(content) <= modified_char_limit else content[:modified_char_limit].rsplit("\n",1)[0] + "\n...[truncated]\n"
+            pieces.append(f"{header}\n{display}\n\n")
+        else:
+            # plain string
+            txt = str(m)
+            display = txt if len(txt) <= modified_char_limit else txt[:modified_char_limit].rsplit("\n",1)[0] + "\n...[truncated]\n"
+            pieces.append(f"{display}\n\n")
+    pieces.append("=== MODIFIED: END ===\n\n")
+
+    # join all pieces
+    full_text = "\n".join(pieces)
+    current_chars = len(full_text)
+    est_tokens = estimate_tokens_from_chars(current_chars)
+
+    diagnostics = {
+        "initial_chars": current_chars,
+        "initial_est_tokens": est_tokens,
+        "proc_count": len(proc_items_sorted),
+        "section_count": len(sec_raw),
+        "modified_count": len(mod_raw),
+        "truncation_steps": []
+    }
+
+    # if over budget, apply conservative truncation steps similar to previous logic:
+    if est_tokens <= token_limit_tokens:
+        diagnostics["final_chars"] = current_chars
+        diagnostics["final_est_tokens"] = est_tokens
+        return full_text, diagnostics
+
+    # 1) Truncate sections more aggressively
+    truncated_pieces = []
+    truncated_pieces.append("=== PROCEDURE: START (FULL) ===\n")
+    for it in proc_items_sorted:
+        cid = it.get("meta", {}).get("chunk_id") or ""
+        score = it.get("meta", {}).get("score")
+        step = it.get("step")
+        header = f"[CID:{cid}" if cid else "[CID:UNKNOWN"
+        if score is not None:
+            header += f" | SCORE:{float(score):.3f}"
+        if step is not None:
+            header += f" | STEP:{step}"
+        header += "]"
+        content = it.get("content", "").strip()
+        truncated_pieces.append(f"{header}\n{content}\n\n")
+    truncated_pieces.append("=== PROCEDURE: END ===\n\n")
+
+    truncated_pieces.append("=== SECTIONS: TRUNCATED ===\n")
+    for s in sec_raw:
+        block = stringify_item(s) if not isinstance(s, str) else s
+        short = block if len(block) <= int(section_char_limit) else block[:int(section_char_limit)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+        truncated_pieces.append(f"{short}\n\n")
+
+    truncated_pieces.append("=== MODIFIED: TRUNCATED ===\n")
+    for m in mod_raw:
+        if isinstance(m, dict):
+            content = m.get("content") or ""
+            short = content if len(content) <= int(modified_char_limit) else content[:int(modified_char_limit)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+            header = f"[CID:{m.get('cid') or ''} | TYPE:{m.get('type') or ''} | STEP:{m.get('step') or ''}]"
+            truncated_pieces.append(f"{header}\n{short}\n\n")
+        else:
+            txt = str(m)
+            short = txt if len(txt) <= int(modified_char_limit) else txt[:int(modified_char_limit)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+            truncated_pieces.append(f"{short}\n\n")
+
+    candidate = "\n".join(truncated_pieces)
+    cand_chars = len(candidate)
+    cand_tokens = estimate_tokens_from_chars(cand_chars)
+    diagnostics["after_first_trunc_chars"] = cand_chars
+    diagnostics["after_first_trunc_tokens"] = cand_tokens
+    diagnostics["truncation_steps"].append("truncated sections & modified entries")
+
+    if cand_tokens <= token_limit_tokens:
+        diagnostics["final_chars"] = cand_chars
+        diagnostics["final_est_tokens"] = cand_tokens
+        return candidate, diagnostics
+
+    # 2) Truncate long procedure steps preserving headers
+    final_pieces = []
+    final_pieces.append("=== PROCEDURE: TRUNCATED STEPS ===\n")
+    for it in proc_items_sorted:
+        cid = it.get("meta", {}).get("chunk_id") or ""
+        score = it.get("meta", {}).get("score")
+        step = it.get("step")
+        header = f"[CID:{cid}" if cid else "[CID:UNKNOWN"
+        if score is not None:
+            header += f" | SCORE:{float(score):.3f}"
+        if step is not None:
+            header += f" | STEP:{step}"
+        header += "]"
+        content = it.get("content", "").strip()
+        if len(content) > proc_char_limit:
+            truncated = content[:proc_char_limit].rsplit("\n",1)[0] + "\n...[truncated]\n"
+        else:
+            truncated = content
+        final_pieces.append(f"{header}\n{truncated}\n\n")
+
+    final_pieces.append("=== SECTIONS: SHORT ===\n")
+    for s in sec_raw:
+        block = stringify_item(s) if not isinstance(s, str) else s
+        short = block if len(block) <= int(section_char_limit/2) else block[:int(section_char_limit/2)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+        final_pieces.append(f"{short}\n\n")
+
+    final_pieces.append("=== MODIFIED: SHORT ===\n")
+    for m in mod_raw:
+        if isinstance(m, dict):
+            content = m.get("content") or ""
+            short = content if len(content) <= int(modified_char_limit/2) else content[:int(modified_char_limit/2)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+            header = f"[CID:{m.get('cid') or ''} | TYPE:{m.get('type') or ''} | STEP:{m.get('step') or ''}]"
+            final_pieces.append(f"{header}\n{short}\n\n")
+        else:
+            txt = str(m)
+            short = txt if len(txt) <= int(modified_char_limit/2) else txt[:int(modified_char_limit/2)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+            final_pieces.append(f"{short}\n\n")
+
+    final_text = "\n".join(final_pieces)
+    final_chars = len(final_text)
+    final_tokens = estimate_tokens_from_chars(final_chars)
+    diagnostics["final_chars"] = final_chars
+    diagnostics["final_est_tokens"] = final_tokens
+    diagnostics["truncation_steps"].append("truncated procedure steps & shortened sections/modified")
+
+    # as last resort drop lowest-priority modified items until within budget
+    if final_tokens > token_limit_tokens:
+        reduced_modified = mod_raw.copy()
+        while final_tokens > token_limit_tokens and reduced_modified:
+            reduced_modified.pop()
+            # rebuild small final with reduced_modified
+            temp = []
+            temp.append("=== PROCEDURE: TRUNCATED STEPS ===\n")
+            for it in proc_items_sorted:
+                cid = it.get("meta", {}).get("chunk_id") or ""
+                score = it.get("meta", {}).get("score")
+                step = it.get("step")
+                header = f"[CID:{cid}" if cid else "[CID:UNKNOWN"
+                if score is not None:
+                    header += f" | SCORE:{float(score):.3f}"
+                if step is not None:
+                    header += f" | STEP:{step}"
+                header += "]"
+                content = it.get("content", "").strip()
+                if len(content) > proc_char_limit:
+                    truncated = content[:proc_char_limit].rsplit("\n",1)[0] + "\n...[truncated]\n"
+                else:
+                    truncated = content
+                temp.append(f"{header}\n{truncated}\n\n")
+            temp.append("=== MODIFIED: REDUCED ===\n")
+            for m in reduced_modified:
+                if isinstance(m, dict):
+                    content = m.get("content") or ""
+                    short = content if len(content) <= int(modified_char_limit/2) else content[:int(modified_char_limit/2)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+                    header = f"[CID:{m.get('cid') or ''} | TYPE:{m.get('type') or ''} | STEP:{m.get('step') or ''}]"
+                    temp.append(f"{header}\n{short}\n\n")
+                else:
+                    txt = str(m)
+                    short = txt if len(txt) <= int(modified_char_limit/2) else txt[:int(modified_char_limit/2)].rsplit("\n",1)[0] + "\n...[truncated]\n"
+                    temp.append(f"{short}\n\n")
+            final_text = "\n".join(temp)
+            final_chars = len(final_text)
+            final_tokens = estimate_tokens_from_chars(final_chars)
+
+        diagnostics["final_chars"] = final_chars
+        diagnostics["final_est_tokens"] = final_tokens
+        diagnostics["truncation_steps"].append("iteratively removed modified items to fit budget")
+
+    return final_text, diagnostics
+
+
+
+
 # =========================
 def generate_experimental_guideline(rag_query: str, rag_docs: list, props_json: dict, research_objective: str) -> str:
-    llm = ChatGroq(model_name="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0.3)
+    llm = ChatGroq(model_name="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0)
     prompt = ChatPromptTemplate.from_template("""
 You are a **pharmacokinetics and ADME laboratory expert**.
 
@@ -186,9 +480,16 @@ You have access to:
 - The **retrieved experimental text snippets (Tool 2 RAG results)**
 
 Your task:
-After receiving all text snippets from Tool 2, **stop calling tools** and synthesize *all* the information you have 
-into a **final structured, detailed, and practical experimental design report**.
+Using ONLY the provided content (Tool1 JSON + RAG snippets), synthesize a **final structured, detailed, and practical experimental design report** for a Caco-2 ADME assay..
 
+CRITICAL HARD RULES (must be followed exactly):
+1) **Procedure Steps 1~20 must be reconstructed exactly** from the PROCEDURE block(s) in the provided RAG snippets:
+   - Do NOT merge, renumber, summarize, or drop any step 1~20. -> very important
+   - Preserve original step numbers and original wording/annotations where available.
+   - **ADDITION:** For each reconstructed step that exists in the RAG PROCEDURE block you MUST immediately follow the verbatim step with a short "Required detail" line specifying any missing practical parameters (explicit: volumes, durations, temperatures, sample volumes, sampling interval, replacement volumes, agitation speed, and analytical preparation) *if those details are not present verbatim in the step*. If the verbatim step already contains these parameters, repeat them unchanged.
+2) For every Modified Step (from RAG modified_steps or property alerts), **explicitly link** the modification to the molecular property that motivated it (Tool1 JSON or ph/logD tags).
+3) Any pKa / pH / LogD related alerts must appear under a dedicated subsection "pH / Ionization / LogD considerations" and must include concrete corrective actions (e.g., "Use apical pH 6.5 donor when pKa_out_of_range; monitor unionized fraction; limit DMSO to ≤1% in donor").
+4) Use warning symbol (⚠) inline for any step that deviates from SOP due to properties.
 ---
 
 ### Context
@@ -221,7 +522,7 @@ into a **final structured, detailed, and practical experimental design report**.
 + ⚠ **Prioritize Modified Steps from RAG snippets for unusual cases.**  
 + ⚠ **For each deviation, provide reasoning and concrete adjustment suggestions.**
 
-**4. Experimental Procedure (structured, practical):**  
+**4. Experimental Procedure (structured):**  
 Provide a **concise, step-wise experimental workflow** optimized for the molecule.  
 Organize under these subheaders:
    - **Reagents:** (List all chemical reagents and buffer systems typically required)  
@@ -231,31 +532,30 @@ Organize under these subheaders:
 +        - **Crucially include Trans-Epithelial Electrical Resistance (TER) measurement device (e.g., Endohm chamber with voltmeter).**
 +        - **Specify the type of Caco-2 plates (e.g., 12-well Transwell inserts).**
    - **Setup:** (Describe pre-experiment setup — e.g., cell seeding density, pre-incubation time, solvent prep)  
-+        - **Specify standard Caco-2 cell seeding density (e.g., 2.6 x 10^5 cells/cm^2) and justify any deviations based on molecular properties.**
-+        - **State the pre-incubation/differentiation time clearly (e.g., 21-29 days).**
-+        - **Describe the preparation of donor and receiver solutions, including any co-solvents (DMSO) or additives (BSA) with their final concentrations and placement (e.g., "DMSO max 1% in both compartments", "4% BSA in receiver compartment").**
++        - **Specify standard Caco-2 cell seeding density and justify any deviations based on molecular properties.**
++        - **State the pre-incubation/differentiation time clearly.**
++        - **Describe the preparation of donor and receiver solutions, including any co-solvents (DMSO) or additives (BSA) with their final concentrations and placement.**
 +        - ⚠ **Ensure all Modified Steps identified in RAG snippets are incorporated here and clearly referenced in the Experimental Steps.**
-   - **Experimental Steps (20 steps, detailed and precise):**  
+   - **Experimental Steps (from step 1 to step 20, detailed and precise):**  
         Provide 20 **clear, numbered steps** outlining the optimized experimental procedure for the molecule.  
 +        **These steps must fully cover the entire Caco-2 assay workflow, from initial cell culture preparation to final data interpretation.**
 +        **Crucial steps to include are:**
 +        - **Caco-2 cell thawing, culturing, trypsinization, counting, and seeding onto permeable supports.**
-+        - **Regular media changes for 21-29 days to ensure differentiation.**
 +        - **Pre-experiment washing of monolayers with HBSS.**
 +        - **Trans-Epithelial Electrical Resistance (TER) measurement (before and after transport experiment).**
-+        - **Cell monolayer integrity test (e.g., [14C]Mannitol permeability assay) as a quality control and for toxicity assessment.**
-+        - **Preparation of donor and receiver solutions with specific pH (e.g., pH 7.4, or pH 6.5 for apical side if needed).**
++        - **Cell monolayer integrity test as a quality control and for toxicity assessment.**
++        - **Preparation of donor and receiver solutions with specific pH**
 +        - **Performing transport experiments in both apical-to-basolateral (absorptive) AND basolateral-to-apical (secretory) directions for efflux ratio calculation.**
 +        - **Incubation on an orbital shaker at specified RPM.**
 +        - **Sampling from the receiver compartment at multiple time points, specifying sample volume and replacement with fresh buffer.**
 +        - **Final sample collection from the donor compartment for mass balance calculation.**
 +        - **Analytical method (LC-MS) for quantification.**
 +        - **Calculation of apparent permeability coefficient (Papp).**
-+        - **Calculation of efflux ratio/uptake ratio for transport mechanism evaluation.**
 +        - **Data interpretation.**
         - If the molecule deviates from SOP, describe how each step is modified accordingly.  
-        - Each step should be a precise action sentence (e.g., “Incubate Caco-2 cells at 37°C for 1h in HBSS buffer”).  
-        - Highlight any modified steps with clear justification (e.g., “⚠ Adjusted due to high MW or low solubility”).  
+        - Each step should be a precise action sentence.  
+        - **ADDITION:** For any step where the RAG snippet is terse, include a "Required detail" line with concrete numeric parameters (volume, time, temperature, rpm, sampling interval) — do not invent values; if the RAG snippet lacks a numeric value, state "NUMERIC DETAIL MISSING: <parameter>".
+        - Highlight any modified steps with clear justification.  
         - Steps should be complete and practically implementable; avoid overly short summaries.
 
 **5. Modified Steps(special case):** 
@@ -290,15 +590,50 @@ End with a single formal statement asking for a tailored plan:
 Now generate the final structured report accordingly.
 """)
 
-    rag_block = "\n\n".join(rag_docs) if rag_docs else "(no snippets)"
+    # Build rag_block with token-aware truncation
+    rag_result_struct = {
+        # If your retrieve function already returned dict, pass it directly.
+        # If you only have rag_docs (list of strings), wrap into fields for backward compatibility.
+        "procedure_steps": [],
+        "section_topk": [],
+        "modified_steps": []
+    }
+
+    # If 'rag_docs' is a list of dicts (from new tool2), try to detect and map
+    if isinstance(rag_docs, dict):
+        rag_result_struct = rag_docs
+    else:
+        # heuristics: try to split out procedure-like entries (those starting with 'Step' or containing 'PROCEDURE')
+        for item in rag_docs:
+            s = item.strip()
+            if re.match(r'^\[.*PROCEDURE.*\]', s, flags=re.I) or re.search(r'\b[Ss]tep\s*\d+\b', s):
+                rag_result_struct["procedure_steps"].append(s)
+            elif 'modified' in s.lower() or 'mannitol' in s.lower() or 'modified step' in s.lower():
+                rag_result_struct["modified_steps"].append(s)
+            else:
+                rag_result_struct["section_topk"].append(s)
+
+    # Build rag_block (string) and diagnostics
+    rag_block, rag_diag = build_rag_block(rag_result_struct,
+                                        proc_char_limit=2000,
+                                        section_char_limit=1200,
+                                        modified_char_limit=1200,
+                                        token_limit_tokens=18000,
+                                        token_est_chars_per_token=4.0)
+
+    # optional: show diagnostics in Streamlit (helpful during debugging)
+    try:
+        st.caption(f"RAG block tokens est: {rag_diag.get('final_est_tokens')} (chars {rag_diag.get('final_chars')})")
+    except Exception:
+        pass
+
     resp = (prompt | llm).invoke({
         "research_objective": research_objective,
         "props_json": json.dumps(props_json, ensure_ascii=False, indent=2),
         "rag_docs": rag_block
     })
+
     return resp.content.strip()
-
-
 
 # =========================
 # SOP 범위 판정 + 하이라이트 카드 렌더링
